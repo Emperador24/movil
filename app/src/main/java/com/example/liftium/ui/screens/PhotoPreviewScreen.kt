@@ -20,6 +20,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
+import com.example.liftium.model.ProgressPhotoViewModel
 import com.example.liftium.ui.theme.Dimens
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -29,6 +30,7 @@ fun PhotoPreviewScreen(
     onSaveClick: (Double?, String?) -> Unit,
     onRetakeClick: () -> Unit,
     onCancelClick: () -> Unit,
+    progressPhotoViewModel: ProgressPhotoViewModel? = null,
     modifier: Modifier = Modifier
 ) {
     var weight by remember { mutableStateOf("") }
