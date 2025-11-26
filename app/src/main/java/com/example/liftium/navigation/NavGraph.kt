@@ -30,7 +30,6 @@ import androidx.navigation3.runtime.rememberSavedStateNavEntryDecorator
 import androidx.navigation3.ui.NavDisplay
 import androidx.navigation3.ui.rememberSceneSetupNavEntryDecorator
 import com.example.liftium.R
-import com.example.liftium.mock.MockData
 import com.example.liftium.model.*
 import com.example.liftium.util.BiometricAuthenticator
 import com.example.liftium.ui.screens.*
@@ -121,14 +120,14 @@ fun NavigationHost(modifier: Modifier = Modifier) {
     val workoutState by workoutViewModel.state.collectAsState()
     
     val activity = LocalContext.current as FragmentActivity
-    val biometricAuthenticator = remember { BiometricAuthenticator(activity) }
+    //val biometricAuthenticator = remember { BiometricAuthenticator(activity) }
 
-    var visualProgressAuthenticated by rememberSaveable { mutableStateOf(false) }
+    //var visualProgressAuthenticated by rememberSaveable { mutableStateOf(false) }
 
     // Determinar la ruta inicial basada en el estado de autenticación
     val startDestination = if (authState.isAuthenticated) HomeRoute else LoginRoute
     val backStack = rememberNavBackStack(startDestination)
-
+    val navigateToVisualProgress: () -> Unit = { backStack.add(VisualProgressRoute) }
     // Observar cambios en el estado de autenticación
     LaunchedEffect(authState.isAuthenticated) {
         val currentKey = backStack.lastOrNull()
@@ -155,7 +154,7 @@ fun NavigationHost(modifier: Modifier = Modifier) {
     }
 
     // Helper function to handle protected navigation to VisualProgress
-    val navigateToVisualProgress: () -> Unit = {
+   /* val navigateToVisualProgress: () -> Unit = {
         if (visualProgressAuthenticated) {
             // Already authenticated this session, just navigate
             backStack.add(VisualProgressRoute)
@@ -171,7 +170,7 @@ fun NavigationHost(modifier: Modifier = Modifier) {
                 }
             }
         }
-    }
+    }*/
 
     NavDisplay(
         modifier = modifier,
@@ -575,7 +574,7 @@ fun NavigationHost(modifier: Modifier = Modifier) {
                     VisualProgressScreen(
                         photos = photoState.photos,
                         onBackClick = {
-                            visualProgressAuthenticated = false // Reset auth state on exit
+                            //visualProgressAuthenticated = false // Reset auth state on exit
                             backStack.removeLastOrNull()
                         },
                         onPhotoClick = { _ ->
@@ -610,6 +609,7 @@ fun NavigationHost(modifier: Modifier = Modifier) {
 
                     PhotoPreviewScreen(
                         photoUri = photoUri,
+                        progressPhotoViewModel = progressPhotoViewModel, // ← Añade esto
                         onSaveClick = { weight, notes ->
                             val success = progressPhotoViewModel.saveProgressPhoto(
                                 photoUri = photoUri,
@@ -619,14 +619,11 @@ fun NavigationHost(modifier: Modifier = Modifier) {
                             )
 
                             if (success) {
-                                // Navigate back to Visual Progress screen
-                                // Clear the camera and preview screens from backstack
                                 backStack.removeLastOrNull() // Remove preview
                                 backStack.removeLastOrNull() // Remove camera
                             }
                         },
                         onRetakeClick = {
-                            // Go back to camera
                             backStack.removeLastOrNull()
                         },
                         onCancelClick = {
