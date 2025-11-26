@@ -10,65 +10,136 @@ import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.storage.FirebaseStorage
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 import java.io.File
 import java.io.FileOutputStream
-import java.io.OutputStream
 import java.time.LocalDate
 import java.time.LocalDateTime
+import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.UUID
 
 /**
- * ViewModel for managing progress photos
- * 
- * Current Implementation: In-memory storage
- * Future: Will integrate with database (Room/Firebase) for persistence
- * 
- * Design considerations for future database integration:
- * - Photos list will come from database queries
- * - Add/update/delete operations will persist to database
- * - UserId will link photos to authenticated users
- * - Image paths will reference actual file storage
+ * ViewModel for managing progress photos with Firebase Storage integration
  */
 data class ProgressPhotoState(
     val photos: List<ProgressPhotoWithDetails> = emptyList(),
     val isLoading: Boolean = false,
+    val isUploading: Boolean = false,
+    val uploadProgress: Float = 0f,
     val errorMessage: String? = null,
     val capturedPhotoUri: Uri? = null,
     val tempPhotoFile: File? = null
 )
 
 class ProgressPhotoViewModel : ViewModel() {
-    
+
     private val _state = MutableStateFlow(ProgressPhotoState())
     val state: StateFlow<ProgressPhotoState> = _state.asStateFlow()
-    
+
+    private val auth = FirebaseAuth.getInstance()
+    private val firestore = FirebaseFirestore.getInstance()
+    private val storage = FirebaseStorage.getInstance()
+
     companion object {
         private const val TAG = "ProgressPhotoViewModel"
         private const val PHOTO_DIRECTORY = "Liftium"
+        private const val STORAGE_PATH = "progress_photos"
+        private const val COLLECTION_NAME = "progress_photos"
     }
-    
-    // TODO: Replace with actual user ID from authentication
-    private val currentUserId: String
-        get() = "temp_user_${System.currentTimeMillis()}" // Placeholder
-    
+
+    private val currentUserId: String?
+        get() = auth.currentUser?.uid
+
+    init {
+        loadPhotos()
+    }
+
     /**
-     * Load photos for the current user
-     * TODO: In future, this will query from database
+     * Load photos for the current user from Firestore
      */
     fun loadPhotos() {
-        Log.d(TAG, "Loading photos for user: $currentUserId")
-        // Current: Photos already in state (in-memory)
-        // Future: Query database and update state
-        _state.value = _state.value.copy(isLoading = false)
+        val userId = currentUserId
+        if (userId == null) {
+            Log.w(TAG, "User not authenticated")
+            _state.value = _state.value.copy(
+                isLoading = false,
+                errorMessage = "User not authenticated"
+            )
+            return
+        }
+
+        viewModelScope.launch {
+            try {
+                _state.value = _state.value.copy(isLoading = true, errorMessage = null)
+
+                Log.d(TAG, "Loading photos for user: $userId")
+
+                val snapshot = firestore.collection(COLLECTION_NAME)
+                    .whereEqualTo("userId", userId)
+                    .get()
+                    .await()
+
+                val photos = snapshot.documents.mapNotNull { doc ->
+                    try {
+                        val id = doc.getString("id") ?: return@mapNotNull null
+                        val imagePath = doc.getString("imagePath") ?: return@mapNotNull null
+                        val weight = doc.getDouble("weight")
+                        val notes = doc.getString("notes")
+                        val dateEpoch = doc.getLong("date") ?: return@mapNotNull null
+                        val createdAtEpoch = doc.getLong("createdAt") ?: return@mapNotNull null
+
+                        val photo = ProgressPhoto(
+                            id = id,
+                            userId = userId,
+                            imagePath = imagePath,
+                            weight = weight,
+                            notes = notes,
+                            date = LocalDate.ofEpochDay(dateEpoch),
+                            createdAt = LocalDateTime.ofEpochSecond(createdAtEpoch, 0, ZoneOffset.UTC)
+                        )
+
+                        ProgressPhotoWithDetails(
+                            photo = photo,
+                            formattedDate = formatDate(photo.date),
+                            formattedWeight = photo.weight?.let { "${it.toInt()} lbs" } ?: "No weight"
+                        )
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error parsing photo document: ${doc.id}", e)
+                        null
+                    }
+                }
+
+                // Sort by date descending (newest first)
+                val sortedPhotos = photos.sortedByDescending { it.photo.date }
+
+                _state.value = _state.value.copy(
+                    photos = sortedPhotos,
+                    isLoading = false
+                )
+
+                Log.d(TAG, "Loaded ${sortedPhotos.size} photos")
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Error loading photos", e)
+                _state.value = _state.value.copy(
+                    isLoading = false,
+                    errorMessage = "Failed to load photos: ${e.message}"
+                )
+            }
+        }
     }
-    
+
     /**
      * Set the captured photo URI temporarily
-     * This is used between camera capture and preview/save
      */
     fun setCapturedPhotoUri(uri: Uri?, file: File?) {
         Log.d(TAG, "Setting captured photo URI: $uri")
@@ -77,16 +148,9 @@ class ProgressPhotoViewModel : ViewModel() {
             tempPhotoFile = file
         )
     }
-    
+
     /**
-     * Save a new progress photo with details
-     * 
-     * @param photoUri Uri of the captured photo
-     * @param weight User's weight (optional)
-     * @param notes User's notes (optional)
-     * @param context Application context for saving to gallery
-     * 
-     * Future: This will also save to database with userId reference
+     * Save a new progress photo - uploads to Firebase Storage and saves metadata to Firestore
      */
     fun saveProgressPhoto(
         photoUri: Uri,
@@ -94,79 +158,113 @@ class ProgressPhotoViewModel : ViewModel() {
         notes: String?,
         context: Context
     ): Boolean {
-        return try {
-            Log.d(TAG, "Saving progress photo: $photoUri")
-            
-            // Save to device gallery
-            val savedUri = savePhotoToGallery(photoUri, context)
-            
-            if (savedUri != null) {
-                // Create ProgressPhoto object
-                val now = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    LocalDate.now()
-                } else {
-                    LocalDate.now()
-                }
-                
-                val nowTime = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    LocalDateTime.now()
-                } else {
-                    LocalDateTime.now()
-                }
-                
-                val photo = ProgressPhoto(
-                    id = UUID.randomUUID().toString(),
-                    userId = currentUserId, // Will be actual user ID in future
-                    imagePath = savedUri.toString(),
-                    weight = weight,
-                    notes = notes,
-                    date = now,
-                    createdAt = nowTime
-                )
-                
-                // Format data for display
-                val photoWithDetails = ProgressPhotoWithDetails(
-                    photo = photo,
-                    formattedDate = formatDate(now),
-                    formattedWeight = weight?.let { "${it.toInt()} lbs" } ?: "No weight"
-                )
-                
-                // Add to in-memory list (current implementation)
-                val updatedPhotos = _state.value.photos.toMutableList().apply {
-                    add(0, photoWithDetails) // Add to beginning (most recent first)
-                }
-                
+        val userId = currentUserId
+        if (userId == null) {
+            Log.e(TAG, "User not authenticated")
+            _state.value = _state.value.copy(
+                errorMessage = "User not authenticated"
+            )
+            return false
+        }
+
+        viewModelScope.launch {
+            try {
                 _state.value = _state.value.copy(
-                    photos = updatedPhotos,
+                    isUploading = true,
+                    uploadProgress = 0f,
+                    errorMessage = null
+                )
+
+                Log.d(TAG, "Starting photo upload to Firebase Storage")
+
+                // Generate unique ID for the photo
+                val photoId = UUID.randomUUID().toString()
+                val timestamp = System.currentTimeMillis()
+
+                // Create storage reference
+                val storageRef = storage.reference
+                    .child(STORAGE_PATH)
+                    .child(userId)
+                    .child("${photoId}_${timestamp}.jpg")
+
+                Log.d(TAG, "Storage path: ${storageRef.path}")
+
+                // Upload the file to Firebase Storage
+                val uploadTask = storageRef.putFile(photoUri)
+
+                // Monitor upload progress
+                uploadTask.addOnProgressListener { taskSnapshot ->
+                    val progress = (100.0 * taskSnapshot.bytesTransferred / taskSnapshot.totalByteCount).toFloat()
+                    _state.value = _state.value.copy(uploadProgress = progress / 100f)
+                    Log.d(TAG, "Upload progress: $progress%")
+                }
+
+                // Wait for upload to complete
+                uploadTask.await()
+
+                Log.d(TAG, "Upload completed, getting download URL")
+
+                // Get the download URL
+                val downloadUrl = storageRef.downloadUrl.await().toString()
+
+                Log.d(TAG, "Download URL: $downloadUrl")
+
+                // Save to device gallery (optional, for user convenience)
+                val localUri = savePhotoToGallery(photoUri, context)
+
+                // Create photo document for Firestore
+                val now = LocalDate.now()
+                val nowTime = LocalDateTime.now()
+
+                val photoData = hashMapOf(
+                    "id" to photoId,
+                    "userId" to userId,
+                    "imagePath" to downloadUrl, // Store Firebase Storage URL
+                    "weight" to weight,
+                    "notes" to notes,
+                    "date" to now.toEpochDay(),
+                    "createdAt" to nowTime.toEpochSecond(ZoneOffset.UTC)
+                )
+
+                // Save to Firestore
+                firestore.collection(COLLECTION_NAME)
+                    .document(photoId)
+                    .set(photoData)
+                    .await()
+
+                Log.d(TAG, "Photo metadata saved to Firestore")
+
+                // Clear temporary state
+                _state.value = _state.value.copy(
+                    isUploading = false,
+                    uploadProgress = 0f,
                     capturedPhotoUri = null,
                     tempPhotoFile = null
                 )
-                
-                Log.d(TAG, "Photo saved successfully. Total photos: ${updatedPhotos.size}")
-                
-                // TODO: In future, save to database here
-                // database.progressPhotoDao().insert(photo)
-                
-                true
-            } else {
-                Log.e(TAG, "Failed to save photo to gallery")
+
+                // Delete temp file
+                _state.value.tempPhotoFile?.delete()
+
+                // Reload photos to show the new one
+                loadPhotos()
+
+                Log.d(TAG, "Photo saved successfully")
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Error saving progress photo", e)
                 _state.value = _state.value.copy(
-                    errorMessage = "Failed to save photo to gallery"
+                    isUploading = false,
+                    uploadProgress = 0f,
+                    errorMessage = "Failed to save photo: ${e.message}"
                 )
-                false
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error saving progress photo", e)
-            _state.value = _state.value.copy(
-                errorMessage = "Error saving photo: ${e.message}"
-            )
-            false
         }
+
+        return true
     }
-    
+
     /**
-     * Save photo to device gallery (Photos app)
-     * Returns the Uri of the saved photo
+     * Save photo to device gallery (optional)
      */
     private fun savePhotoToGallery(photoUri: Uri, context: Context): Uri? {
         return try {
@@ -177,32 +275,29 @@ class ProgressPhotoViewModel : ViewModel() {
                     BitmapFactory.decodeStream(inputStream)
                 }
             }
-            
+
             if (bitmap == null) {
                 Log.e(TAG, "Failed to decode bitmap from URI")
                 return null
             }
-            
-            // Generate filename
+
             val filename = "Liftium_${System.currentTimeMillis()}.jpg"
-            
+
             val savedUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // For Android 10 and above, use MediaStore
                 savePhotoWithMediaStore(bitmap, filename, context)
             } else {
-                // For older versions, save to Pictures directory
                 savePhotoToFile(bitmap, filename)
             }
-            
+
             Log.d(TAG, "Photo saved to gallery: $savedUri")
             savedUri
-            
+
         } catch (e: Exception) {
             Log.e(TAG, "Error saving photo to gallery", e)
             null
         }
     }
-    
+
     /**
      * Save photo using MediaStore API (Android 10+)
      */
@@ -219,70 +314,107 @@ class ProgressPhotoViewModel : ViewModel() {
                 put(MediaStore.Images.Media.IS_PENDING, 1)
             }
         }
-        
+
         val resolver = context.contentResolver
         val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
-        
+
         uri?.let {
             resolver.openOutputStream(it)?.use { outputStream ->
                 bitmap.compress(Bitmap.CompressFormat.JPEG, 95, outputStream)
             }
-            
-            // Mark as complete
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 contentValues.clear()
                 contentValues.put(MediaStore.Images.Media.IS_PENDING, 0)
                 resolver.update(it, contentValues, null, null)
             }
         }
-        
+
         return uri
     }
-    
+
     /**
      * Save photo to file (Android 9 and below)
      */
     private fun savePhotoToFile(bitmap: Bitmap, filename: String): Uri? {
         val picturesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
         val liftiumDir = File(picturesDir, PHOTO_DIRECTORY)
-        
+
         if (!liftiumDir.exists()) {
             liftiumDir.mkdirs()
         }
-        
+
         val file = File(liftiumDir, filename)
-        
+
         FileOutputStream(file).use { outputStream ->
             bitmap.compress(Bitmap.CompressFormat.JPEG, 95, outputStream)
         }
-        
+
         return Uri.fromFile(file)
     }
-    
+
     /**
-     * Delete a progress photo
-     * 
-     * Future: This will also delete from database
+     * Delete a progress photo - removes from both Firebase Storage and Firestore
      */
     fun deleteProgressPhoto(photoId: String) {
-        Log.d(TAG, "Deleting progress photo: $photoId")
-        
-        val updatedPhotos = _state.value.photos.filterNot { it.photo.id == photoId }
-        _state.value = _state.value.copy(photos = updatedPhotos)
-        
-        // TODO: In future, delete from database
-        // database.progressPhotoDao().delete(photoId)
+        val userId = currentUserId
+        if (userId == null) {
+            Log.e(TAG, "User not authenticated")
+            return
+        }
+
+        viewModelScope.launch {
+            try {
+                Log.d(TAG, "Deleting photo: $photoId")
+
+                // Get photo document to retrieve storage path
+                val doc = firestore.collection(COLLECTION_NAME)
+                    .document(photoId)
+                    .get()
+                    .await()
+
+                val imagePath = doc.getString("imagePath")
+
+                // Delete from Firebase Storage if path exists
+                if (imagePath != null && imagePath.startsWith("https://")) {
+                    try {
+                        val storageRef = storage.getReferenceFromUrl(imagePath)
+                        storageRef.delete().await()
+                        Log.d(TAG, "Photo deleted from Storage")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error deleting from Storage (continuing anyway)", e)
+                    }
+                }
+
+                // Delete from Firestore
+                firestore.collection(COLLECTION_NAME)
+                    .document(photoId)
+                    .delete()
+                    .await()
+
+                Log.d(TAG, "Photo deleted from Firestore")
+
+                // Reload photos
+                loadPhotos()
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Error deleting photo", e)
+                _state.value = _state.value.copy(
+                    errorMessage = "Failed to delete photo: ${e.message}"
+                )
+            }
+        }
     }
-    
+
     /**
-     * Clear any error messages
+     * Clear error message
      */
     fun clearError() {
         _state.value = _state.value.copy(errorMessage = null)
     }
-    
+
     /**
-     * Clear captured photo URI (e.g., when user cancels)
+     * Clear captured photo URI
      */
     fun clearCapturedPhoto() {
         _state.value.tempPhotoFile?.delete()
@@ -291,14 +423,14 @@ class ProgressPhotoViewModel : ViewModel() {
             tempPhotoFile = null
         )
     }
-    
+
     /**
      * Format date for display
      */
     private fun formatDate(date: LocalDate): String {
         val today = LocalDate.now()
         val yesterday = today.minusDays(1)
-        
+
         return when (date) {
             today -> "Today"
             yesterday -> "Yesterday"
@@ -312,17 +444,14 @@ class ProgressPhotoViewModel : ViewModel() {
             }
         }
     }
-    
+
     /**
      * Get total number of photos
-     * Future: This will query from database
      */
     fun getTotalPhotos(): Int = _state.value.photos.size
-    
+
     /**
      * Get latest photo
-     * Future: This will query from database
      */
     fun getLatestPhoto(): ProgressPhoto? = _state.value.photos.firstOrNull()?.photo
 }
-
